@@ -17,6 +17,9 @@ param(
     [int]$MinConnAgeSec = 300,      # only watch connections at least this old
     [double]$ReplyWindowSec = 1.0,  # Rx within this time after our Tx is treated as a reply
     [int]$MinPushBytes = 64,        # smaller server pushes (~31-byte server keepalives) are ignored
+    [double]$BurstSec = 2.0,        # pushes within this window are evaluated together
+    [int]$BurstMinBytes = 400,      # notify if a burst totals this many bytes ...
+    [int]$BurstMinConns = 2,        # ... or touches this many connections (a message hit both; sync noise hit one)
     [int]$CooldownSec = 10,         # minimum gap between notifications
     [int]$RefreshSec = 60,          # how often to re-check the app's connections
     [string]$LogDir = (Join-Path $env:LOCALAPPDATA 'nworks-watch')
@@ -82,6 +85,7 @@ $lastTx = @{}          # local port -> last PC->server payload time
 $seen = @{}            # dedupe key -> time (pktmon logs each packet at several components)
 $lastNotify = [datetime]::MinValue
 $lastRefresh = [datetime]::MinValue
+$burst = $null         # @{ Start; Bytes; Ports = @{}; Parts = list }
 $started = Get-Date
 $pattern = '(\d+\.\d+\.\d+\.\d+)\.(\d+) > (\d+\.\d+\.\d+\.\d+)\.(\d+): Flags \[[^\]]+\](?:, seq (\d+)(?::\d+)?)?.*length (\d+)\s*$'
 
@@ -90,6 +94,21 @@ try {
     while ($true) {
         $now = Get-Date
         if ($DurationSec -gt 0 -and ($now - $started).TotalSeconds -ge $DurationSec) { break }
+
+        if ($burst -and ($now - $burst.Start).TotalSeconds -ge $BurstSec) {
+            $hit = $burst.Bytes -ge $BurstMinBytes -or $burst.Ports.Count -ge $BurstMinConns
+            $summary = "conns=$($burst.Ports.Count) bytes=$($burst.Bytes) [$($burst.Parts -join ' ')]"
+            $burst = $null
+            if (-not $hit) {
+                Write-Log "push ignored: $summary"
+            } elseif (($now - $lastNotify).TotalSeconds -lt $CooldownSec) {
+                Write-Log "push (cooldown): $summary"
+            } else {
+                Write-Log "push NOTIFY: $summary"
+                $lastNotify = $now
+                try { & $notify -Title 'NAVER WORKS' -Message '새 알림이 도착했어요' } catch { Write-Log "notify failed: $_" }
+            }
+        }
 
         if (($now - $lastRefresh).TotalSeconds -ge $RefreshSec) {
             $lastRefresh = $now
@@ -150,11 +169,10 @@ try {
             Write-Verbose "Rx small push ignored port=$dport len=$len"
             continue
         }
-        Write-Log "server push port=$dport len=$len"
-        if (($now - $lastNotify).TotalSeconds -ge $CooldownSec) {
-            $lastNotify = $now
-            try { & $notify -Title 'NAVER WORKS' -Message '새 알림이 도착했어요' } catch { Write-Log "notify failed: $_" }
-        }
+        if (-not $burst) { $burst = @{ Start = $now; Bytes = 0; Ports = @{}; Parts = New-Object System.Collections.Generic.List[string] } }
+        $burst.Bytes += $len
+        $burst.Ports[$dport] = $true
+        $burst.Parts.Add("${dport}:$len")
     }
 } finally {
     if ($proc) { Stop-Capture $proc }
